@@ -1,5 +1,5 @@
 #!/usr/bin/php
-<?
+<?php
 #set_include_path('/usr/share/pear');
 ini_set('memory_limit', '256M');
 require 'Console/CommandLine.php';
