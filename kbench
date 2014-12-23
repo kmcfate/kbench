@@ -1,0 +1,586 @@
+#!/usr/bin/php
+<?
+#set_include_path('/usr/share/pear');
+ini_set('memory_limit', '256M');
+require 'Console/CommandLine.php';
+
+class kbench{
+    private $config;
+    private $host;
+    private $urls=array();
+    private $bareurls=array();
+    private $log;
+    private $loghandle;
+    private $baseline=0;
+
+    private $sockets=array();
+    private $connecting=array();
+    private $completed=array();
+    private $reported=array();
+    private $concurrent=0;
+    private $created=0;
+    private $lastsocket=0;
+    private $time_last=0;
+    private $status_last=0;
+
+    private $good=array();
+    private $status=array();
+    private $size=array();
+    private $requrls=array();
+    private $time_s=array();
+    private $time_t=array();
+    private $time_c=array();
+    private $time_f=array();
+
+    private function add_url($url){
+        $count=count($this->urls);
+        if($this->config->options['compress']){
+            $acceptencoding="Accept-Encoding: gzip,deflate,sdch\r\n";
+        }else{
+            $acceptencoding="";
+        }
+        $this->urls[$count]="GET ".$url." HTTP/1.1\r\nUser-Agent: Mozilla\r\nHost: ".$this->config->args['host']."\r\n".$acceptencoding."Connection: Close\r\n\r\n";
+        $this->bareurls[$count]=$url;
+    }
+
+    public function kbench($config){
+        $this->config=$config;
+        $this->host=gethostbyname($config->args['host']).":".$config->options['port'];
+        if($config->options['urlfile']!=''){
+            $fd=fopen($config->options['urlfile'],'r');
+            if($fd){
+                while((($buffer=fgets($fd,4096)) !== false)){
+                    $this->add_url(chop($buffer));
+                }
+            }else{
+                die('Could not open URL file');
+            }
+
+        }else{
+            $this->add_url($config->options['url']);
+        }
+        reset($this->urls);
+        if(!$this->config->options['timing']) $this->get_baseline_latency();
+        $this->log=$config->options['log'];
+        if($this->config->options['step']==0) $this->config->options['step']=($this->baseline*100)/$this->config->options['granularity'];
+    }
+
+    private function add_request(){
+        $s = stream_socket_client($this->host, $errno, $errstr,
+                0, STREAM_CLIENT_ASYNC_CONNECT|STREAM_CLIENT_CONNECT);
+        if($s){
+            //'unique' request id
+            $rid=(int)$s;
+            $this->time_s[$rid]=$this->time_t[$rid]=$this->time_c[$rid]=$this->time_f[$rid]=microtime(true);
+            $this->connecting[$rid]=$this->sockets[$rid]=$s;
+            $this->size[$rid]=0;
+        }else{
+            die("\nSocket failure, this should not happen!\n");
+        }
+    }
+
+    private function clear(){
+        $this->sockets=array();
+        $this->connecting=array();
+        $this->completed=array();
+        $this->good=array();
+        $this->reported=array();
+        $this->concurrent=0;
+        $this->created=0;
+        $this->lastsocket=0;
+        $this->time_last=0;
+        $this->status_last=0;
+
+        $this->status=array();
+        $this->requrls=array();
+        $this->size=array();
+        $this->time_s=array();
+        $this->time_t=array();
+        $this->time_c=array();
+        $this->time_f=array();
+    }
+
+    private function poll() {
+        if(count($this->sockets)){
+            $read = $this->sockets;
+            $write = $this->connecting;
+            $n = @stream_select($read, $write, $except = null, 10);
+            if($n){
+                $this->handle_write($write);
+                $this->handle_read($read);
+            }else{
+                $this->handle_timeout();
+                echo "Timeout!\n";
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private function handle_read($read){
+        foreach ($read as $r) {
+            //!!!HACK HACK HACK!!!
+            $rid=(int)$r;
+            $now=microtime(true);
+            $data = fread($r, 65536);
+            $len=strlen($data);
+            if ($len == 0) {
+                //Socket was closed
+                $this->time_last=$this->time_t[$rid]=$now-($this->time_s[$rid]);
+                fclose($r);
+                unset($this->sockets[$rid]);
+                $this->completed[]=$rid;
+                if(isset($this->status[$rid]) && $this->status[$rid] < 500){
+                    $this->good[]=$rid;
+                }
+                if($this->concurrent){
+                    $this->add_request();
+                    $this->created++;
+                }
+            } else {
+                //First byte
+                if($this->size[$rid]==0){
+                    $this->time_f[$rid]=$now-($this->time_s[$rid]);
+                    $this->status_last=$this->status[$rid] = (int)substr($data,9,3);
+                }
+                $this->size[$rid]+=$len;
+                if($this->config->options['timing']){
+                    echo "\n<!-- stamp: ".(($now-$this->time_s[$rid])*1000)." $len -->\n";
+                    echo $data;
+                }
+            }
+        }
+    }
+
+    private function handle_write($write){
+        //we only write to a socket once
+        foreach ($write as $w){
+            $rid=(int)$w;
+            $this->time_c[$rid]=microtime(true)-$this->time_s[$rid];
+            while(!($url=each($this->urls))) reset($this->urls);
+            $this->requrls[$rid]=$url['key'];
+	    if(!@fwrite($w, $url['value'])){
+            //    die("Socket write error. This should not happen!\n");
+            }
+            unset($this->connecting[$rid]);
+        }
+    }
+
+    private function handle_timeout(){
+        foreach($this->sockets as $rid => $s){
+            fclose($s);
+            unset($this->sockets[$rid]);
+            $this->completed[]=$rid;
+        }
+    }
+
+    private function drain(){
+        //Finish up and close all requests and the log
+        $this->concurrent=0;
+        while(count($this->sockets)){
+            if(!$this->poll()){
+                return(false);
+            }
+        }
+        return(true);
+    }
+
+
+    private function startlog(){
+        if($this->log!="") $this->loghandle=fopen($this->log, 'w');
+        if($this->config->options['verbose']){
+            $data="Status,First,Complete,Bytes,URL\n";
+        }else{
+            $data=date("Y-m-d H:i:s").','.getmypid().",Depth,Requests,Good,Bad,Connect,First,Complete,Bytes\n";
+            $data.=date("Y-m-d H:i:s").','.getmypid().",0,0,0,0,0,0,".round($this->baseline*1000).",0\n";
+        }
+        echo $data;
+        if($this->log) fwrite($this->loghandle, $data);
+    }
+
+    private function report($interval=1)
+    {
+        $ttotal=$ctotal=$ftotal=$stotal=$gcount=$bcount=0;
+        $count=count($this->completed)-count($this->reported);
+        foreach($this->completed as $id => $rid){
+            if($this->config->options['verbose']){
+		if(isset($this->status[$rid])){
+  		  $data=$this->status[$rid];
+                }else{
+		  $data="Timeout";
+		  $this->time_f[$rid]=$this->time_t[$rid];
+                }
+
+                $data.=','.$this->time_f[$rid].','.$this->time_t[$rid].','.$this->size[$rid].','.$this->bareurls[$this->requrls[$rid]]."\n";
+                //echo $data;
+                if($this->log!="") fwrite($this->loghandle, $data);
+}
+                //            if(!isset($this->reported[$rid])){
+                //                $this->reported[$rid]=1;
+                if(isset($this->status[$rid]) && $this->status[$rid]<=500){
+                    $gcount++;
+                    $ttotal+=$this->time_t[$rid];
+                    $ctotal+=$this->time_c[$rid];
+                    $ftotal+=$this->time_f[$rid];
+                    $stotal+=$this->size[$rid];
+                }else{
+                    $bcount++;
+                }
+            unset($this->completed[$id]);
+            unset($this->time_t[$rid]);
+            unset($this->time_c[$rid]);
+            unset($this->time_f[$rid]);
+            unset($this->time_s[$rid]);
+            unset($this->status[$rid]);
+            unset($this->size[$rid]);
+            unset($this->requrls[$rid]);
+            unset($this->good[$rid]);
+            //            }
+        }
+        $gcount=$gcount?$gcount:1;
+        $data=date("Y-m-d H:i:s").','.getmypid().','.count($this->sockets).','.$this->created/$interval.','.($count-$bcount)/$interval.','.$bcount/$interval.','.round(1000*$ctotal/$gcount).','.round(1000*$ftotal/$gcount).','.round(1000*$ttotal/$gcount).','.$stotal/$gcount."\n";
+        echo $data;
+        if(!$this->config->options['verbose']){
+            if($this->log!="") fwrite($this->loghandle, $data);
+        }
+        $this->created=0;
+    }
+
+    private function get_baseline_latency(){
+        echo "Getting baseline\n";
+        $warmup=$this->config->options['warmup'];
+        $requests=$this->config->options['baseline'];
+        while($requests>0){
+            $this->add_request();
+            $this->drain();
+            if($warmup){
+                $warmup--;
+            }else{
+                $requests--;
+                if($this->drain()){
+                    $times[]=$this->time_last;
+                }else{
+                    echo "Reset.. slow\n";
+                    $requests=$this->config->options['baseline'];
+                }
+            }
+        }
+        if($count=count($times)){
+            $this->baseline=$count?array_sum($times)/$count:0;
+        }else{
+            die("Error getting baseline, check your options\n");
+        }
+    }
+
+    private function generate()
+    {
+        $steps=100/$this->config->options['granularity'];
+        $this->clear();
+        $this->startlog();
+        $rate=$step=$this->config->options['rate']/$steps;
+        while($steps>0){
+            $delay=1/$rate;
+            $end=microtime(true)+$this->config->options['step'];
+            while(microtime(true)<$end){
+                $this->make_sockets($rate);
+                $this->poll();
+            }
+            $this->report($this->config->options['step']);
+            $rate+=$step;
+            $steps--;
+        }
+        $this->drain();
+    }
+
+    private function make_sockets($rate){
+        if($this->lastsocket==0) $this->lastsocket=microtime(true);
+        if($this->concurrent){
+            for($x=count($this->sockets);$x<$rate;$x++){
+                $this->add_request();
+            }
+        }else{
+            $delay=1/$rate;
+            $now=microtime(true);
+            while($now-$this->lastsocket>$delay){
+                if(count($this->sockets)<$this->config->options['sockets']){
+                    $this->add_request();
+                    $this->created++;
+                }else{
+//	            $this->config->options['rate']=round($this->config->options['rate']*0.9);
+//                    echo "Servers likely overloaded, queueing requests!! Dropping rate to ".$this->config->options['rate']." for ".getmypid()."\n";
+//                    $this->drain();
+//                    $this->clear();
+                }
+                $this->lastsocket+=$delay;
+            }
+            if(count($this->sockets)==0){
+                usleep(1000000*($this->lastsocket+$delay-$now));
+            }
+        }
+    }
+
+    private function getmax()
+    {
+        $this->clear();
+        $this->startlog();
+        $rate=5;
+        $inc=0.25;
+        $delay=1/$rate;
+        $lastb=$lastr=$last=microtime(true);
+        $bad=0;
+        $completed=0;
+        $stable=0;
+        $this->concurrent=1;
+        while(true){
+            $this->make_sockets($rate);
+            $this->poll();
+            $now=microtime(true);
+            if($now-$lastr>1){
+                $this->report();
+                $lastr=$now;
+                if(!$stable && ($this->time_last>$this->baseline*2 || $this->status_last>=500)){
+                    //echo "<";
+                    $stable=0;
+                    $bad=1;
+                    $inc*=0.5;
+                    $lastb=microtime(true);
+                    $completed=count($this->good);
+                    $this->concurrent=0;
+                    while(count($this->sockets)>$rate){
+                        $this->poll();
+                    }
+                    $this->concurrent=1;
+                }
+                if($stable){
+                    if($bad){
+                        $bad=0;
+                    }else{
+                        //echo "-";
+                    }
+                    if($now-$lastb>100/$this->config->options['granularity']){
+                        //                        echo "\n";
+                        $count=count($this->good)-$completed;
+                        $rate=$count/(microtime(true)-$lastb);
+                        $this->drain();
+                        break;
+                    }
+                }else{
+                    if($inc<0.01){
+                        $inc=0.01;
+                        $stable=1;
+                    }
+                    if($bad){
+                        $bad=0;
+                    }else{
+                        //echo ">";
+                        $rate*=1+$inc;
+                        if($rate>1000) $rate=1000;
+                    }
+                }
+            }
+        }
+        return $rate;
+    }
+
+    public function bench(){
+        if($this->config->options['timing']){
+            echo "Doing timing run\n";
+            $this->time();
+        }else if($this->config->options['steady']){
+            $this->startlog();
+            $time=microtime(true);
+            $this->config->options['rate']=round($this->config->options['rate']/$this->config->options['jobs']);
+            for ($x=0;$x<$this->config->options['jobs'];$x++){
+                $pid=pcntl_fork();
+                if($pid == -1){
+                    die("Fork Error!!!\n");
+                }else if($pid){
+                    //Parent
+                }else{
+                    //Child
+                    echo "Forked a process with rate ".$this->config->options['rate']."\n";
+                    while(1){
+                        $this->make_sockets($this->config->options['rate']);
+                        $this->poll();
+                        if(microtime(true)-$time>1.0){
+                            $time=microtime(true);
+                            $this->report();
+                        }
+                    }
+                }
+            }
+            pcntl_wait($status); 
+        }else{
+            echo "Baseline is ".round($this->baseline*1000)."ms\n";
+            if($this->config->options['rate']==0){
+                echo "Determining maximum sustainable request rate\n";
+                $this->config->options['rate']=$this->getmax();
+                echo "Sustainable at ".$this->config->options['rate']."\n";
+                echo "Cooldown...\n";
+                sleep(10);
+            }
+            echo "Starting profile...\n";
+            $this->generate();
+        }
+    }
+
+    private function time(){
+        $this->add_request();
+        $this->drain();
+    }
+}
+
+
+##############################################################################
+#
+
+$parser = new Console_CommandLine(array(
+            'description' => 'Rate based profiling tool.',
+            'version'     => '0.1'
+            ));
+
+$parser->addOption(
+        'urlfile', array(
+            'short_name' => '-f',
+            'long_name' => '--urlfile',
+            'description' => 'read urls to get from a file',
+            'action' => 'StoreString',
+            'default' => '',
+            ));
+
+$parser->addOption(
+        'url', array(
+            'short_name' => '-u',
+            'long_name' => '--url',
+            'description' => 'url to get (default /)',
+            'action' => 'StoreString',
+            'default' => '/',
+            ));
+
+$parser->addOption(
+        'port', array(
+            'short_name' => '-p',
+            'long_name' => '--port',
+            'description' => 'port (default 80)',
+            'action' => 'StoreInt',
+            'default' => '80',
+            ));
+
+$parser->addOption(
+        'log', array(
+            'short_name' => '-l',
+            'long_name' => '--log',
+            'description' => 'file to log data to (default is stdout only)',
+            'action' => 'StoreString',
+            'default' => '',
+            ));
+
+$parser->addOption(
+        'granularity', array(
+            'short_name' => '-g',
+            'long_name' => '--granularity',
+            'description' => 'Number from 1-10, roughly determines accuracy of tests, 10 is fastest 1 is slowest',
+            'action' => 'StoreFloat',
+            'default' => '1',
+            ));
+
+$parser->addOption(
+        'step', array(
+            'short_name' => '-s',
+            'long_name' => '--step',
+            'description' => 'length of each step (default is determined by granularity)',
+            'action' => 'StoreFloat',
+            'default' => '0',
+            ));
+
+$parser->addOption(
+        'baseline', array(
+            'short_name' => '-b',
+            'long_name' => '--baseline',
+            'description' => 'requests used to measure baseline (default is 10)',
+            'action' => 'StoreInt',
+            'default' => '10',
+            ));
+
+$parser->addOption(
+        'warmup', array(
+            'short_name' => '-w',
+            'long_name' => '--warmup',
+            'description' => 'requests used to warm up service before measuring baseline (default is 10)',
+            'action' => 'StoreInt',
+            'default' => '10',
+            ));
+
+$parser->addOption(
+        'rate', array(
+            'short_name' => '-r',
+            'long_name' => '--rate',
+            'description' => 'rate to profile to (default to is determine max rate)',
+            'action' => 'StoreInt',
+            'default' => '0',
+            ));
+
+$parser->addOption(
+        'steady', array(
+            'short_name' => '-d',
+            'long_name' => '--steady',
+            'description' => 'Run at specified rate continuously',
+            'action' => 'StoreTrue',
+            ));
+
+$parser->addOption(
+        'sockets', array(
+            'short_name' => '-o',
+            'long_name' => '--sockets',
+            'description' => 'Max sockets per process',
+            'action' => 'StoreInt',
+	    'default' => '1000',
+            ));
+
+$parser->addOption(
+        'verbose', array(
+            'short_name' => '-v',
+            'long_name' => '--verbose',
+            'description' => 'Output details for every request',
+            'action' => 'StoreTrue',
+            ));
+
+$parser->addOption(
+        'timing', array(
+            'short_name' => '-t',
+            'long_name' => '--timing',
+            'description' => 'Run single detailed timing',
+            'action' => 'StoreTrue',
+            ));
+
+$parser->addOption(
+        'compress', array(
+            'short_name' => '-c',
+            'long_name' => '--compress',
+            'description' => 'Enable gzip',
+            'action' => 'StoreTrue',
+            ));
+
+$parser->addOption(
+        'jobs', array(
+            'short_name' => '-j',
+            'long_name' => '--jobs',
+            'description' => 'Set number of jobs (forked processes) for steady rate testing',
+            'action' => 'StoreInt',
+            'default' => '1',
+            ));
+
+$parser->addArgument('host', array(
+            'description' => 'host to profile',
+            ));
+
+try {
+    $config = $parser->parse();
+} catch (Exception $exc) {
+    $parser->displayError($exc->getMessage());
+}
+
+$kbench=new kbench($config);
+$kbench->bench();
+
+?>
